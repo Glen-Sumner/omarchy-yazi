@@ -8,6 +8,10 @@ Generates a yazi flavor from each Omarchy theme's `colors.toml` palette and
 installs a `theme-set` hook so the matching flavor is activated automatically
 on every theme change.
 
+| Themed with Omarchy | | |
+|:---:|:---:|:---:|
+| ![Yazi themed by omarchy-yazi](screenshot-2026-08-22_21-00-01.png) | ![Yazi themed by omarchy-yazi](screenshot-2026-08-22_21-01-03.png) | ![Yazi themed by omarchy-yazi](screenshot-2026-08-22_21-01-35.png) |
+
 ## Install
 
 ```bash
