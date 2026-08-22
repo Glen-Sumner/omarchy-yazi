@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.glen.omarchy-yazi",
+  "name": "Yazi Theme Sync",
+  "version": "1.0.0",
+  "author": "Glen",
+  "license": "MIT",
+  "description": "Generates a yazi flavor for every Omarchy theme and re-skins yazi automatically whenever you change themes.",
+  "kinds": ["service"],
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}

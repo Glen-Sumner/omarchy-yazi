@@ -1,0 +1,377 @@
+#!/usr/bin/env bash
+# Generate a Yazi flavor from an Omarchy theme palette and (optionally) activate it.
+#
+# Usage:
+#   omarchy-yazi-flavor            Re-generate + activate flavor of the current theme
+#   omarchy-yazi-flavor <theme>    Same, for a specific theme ("Tokyo Night" or "tokyo-night")
+#   omarchy-yazi-flavor --all      Generate flavors for every Omarchy theme (no activation)
+#
+# Flavors land in ~/.config/yazi/flavors/omarchy-<slug>.yazi/ and are kept in
+# sync by the theme-set hook (~/.config/omarchy/hooks/theme-set.d/yazi.sh),
+# so running Yazi instances re-skin instantly on `omarchy theme set ...`.
+set -euo pipefail
+
+FLAVORS_DIR="$HOME/.config/yazi/flavors"
+THEME_TOML="$HOME/.config/yazi/theme.toml"
+
+die() { echo "omarchy-yazi-flavor: $*" >&2; exit 1; }
+warn() { echo "omarchy-yazi-flavor: warning: $*" >&2; }
+
+slugify() { sed -E 's/<[^>]+>//g' <<<"$1" | tr '[:upper:]' '[:lower:]' | tr ' ' '-'; }
+
+pal_try() { # pal_try <key> <colors.toml>; prints value or nothing, never fails
+	local v
+	v=$(grep -m1 -E "^$1[[:space:]]*=" "$2" 2>/dev/null | sed -E 's/^[^=]*=[[:space:]]*"([^"]*)".*/\1/') || true
+	[[ -n $v ]] && printf '%s' "$v"
+	return 0
+}
+
+# First non-empty of the listed keys in <file>: first_of file key [key...]
+first_of() {
+	local f=$1 k
+	shift
+	for k in "$@"; do
+		local v
+		v=$(pal_try "$k" "$f")
+		[[ -n $v ]] && { printf '%s' "$v"; return 0; }
+	done
+	return 1
+}
+
+# Perceived luminance of a "#rrggbb" hex color, 0-255
+lum() { awk -v h="${1#"#"}" 'BEGIN {
+	r = strtonum("0x" substr(h, 1, 2))
+	g = strtonum("0x" substr(h, 3, 2))
+	b = strtonum("0x" substr(h, 5, 2))
+	printf "%.0f", 0.2126 * r + 0.7152 * g + 0.0722 * b
+}'; }
+
+# Locate or synthesize a usable colors.toml for a theme slug.
+resolve_palette() { # resolve_palette <slug> ; prints path to colors.toml
+	local slug=$1 src p tmp
+	src="$HOME/.config/omarchy/themes/$slug"
+	[[ -d $src ]] || src="${OMARCHY_PATH:-/usr/share/omarchy}/themes/$slug"
+	p="$src/colors.toml"
+
+	if [[ ! -f $p && -f $src/alacritty.toml ]]; then
+		tmp=$(mktemp -d)
+		cp "$src/alacritty.toml" "$tmp/"
+		if omarchy-theme-colors-from-alacritty "$tmp" >/dev/null 2>&1 &&
+			[[ -f $tmp/colors.toml ]]; then
+			printf '%s\n' "$tmp/colors.toml"
+			return 0
+		fi
+		rm -rf "$tmp"
+	fi
+	[[ -f $p ]] && { printf '%s\n' "$p"; return 0; }
+	return 1
+}
+
+write_atomic() { # write_atomic <target> ; content on stdin
+	local tmp
+	tmp=$(mktemp "${1%/*}/.$(basename "$1").XXXXXX")
+	cat >"$tmp"
+	chmod 644 "$tmp"
+	mv -f "$tmp" "$1"
+}
+
+	build_flavor() {
+	local theme=$1 dir p src
+	p=$(resolve_palette "$theme") || { warn "no usable palette for '$theme', skipping"; return 1; }
+	src=$(dirname "$p")
+	dir="$FLAVORS_DIR/omarchy-$theme.yazi"
+
+	# Normalize across palette schemas: rich omarchy themes carry semantic
+	# keys; alacritty-derived / ANSI-scheme themes only have color0-15.
+	local MODE BG DBG SURF SEL MUT DIM TXT BRIGHT \
+		C0 C1 C2 C3 C4 C5 C6 C7 C9 \
+		ACC RED YEL ORG GRN CYN MAG
+	BG=$(first_of "$p" background) || { warn "'background' missing in $p, skipping"; return 1; }
+	TXT=$(first_of "$p" foreground) || TXT=$BG
+	BRIGHT=$(first_of "$p" bright_foreground) || BRIGHT=$TXT
+	C1=$(pal_try color1 "$p"); C2=$(pal_try color2 "$p")
+	C3=$(pal_try color3 "$p"); C4=$(pal_try color4 "$p")
+	C5=$(pal_try color5 "$p"); C6=$(pal_try color6 "$p")
+	C8=$(pal_try color8 "$p"); C9=$(pal_try color9 "$p")
+
+	ACC=$(first_of "$p" accent blue) || ACC=${C4:-$BG}
+	RED=$(first_of "$p" red) || RED=${C1:-$ACC}
+	YEL=$(first_of "$p" yellow) || YEL=${C3:-$TXT}
+	GRN=$(first_of "$p" green) || GRN=${C2:-$YEL}
+	CYN=$(first_of "$p" cyan) || CYN=${C6:-${C4:-$ACC}}
+	MAG=$(first_of "$p" magenta) || MAG=${C5:-${C1:-$RED}}
+	ORG=$(first_of "$p" orange brown bright_red) || ORG=${C9:-$YEL}
+
+	SURF=$(first_of "$p" lighter_background) || SURF=${C8:-$BG}
+	SEL=$(first_of "$p" selection_background selection) || SEL=$SURF
+	MUT=$(first_of "$p" muted) || MUT=$SEL
+	DIM=$(first_of "$p" dark_foreground) || DIM=$MUT
+	DBG=$(first_of "$p" darker_background dark_background) || DBG=$BG
+	MODE=$(first_of "$p" mode) || { [[ $(lum "$BG") -gt 127 ]] && MODE=light || MODE=dark; }
+
+	mkdir -p "$dir"
+
+	write_atomic "$dir/flavor.toml" <<EOF
+# vim:fileencoding=utf-8:foldmethod=marker
+# Generated from Omarchy theme "$theme" ($MODE palette) by omarchy-yazi-flavor.
+# Do not edit; edit the theme's colors.toml or the generator instead.
+
+# : Manager {{{
+
+[mgr]
+cwd = { fg = "$CYN", bold = true }
+
+# Find
+find_keyword  = { fg = "$YEL", bold = true, italic = true, underline = true }
+find_position = { fg = "$MAG", bg = "reset", bold = true, italic = true }
+
+# Marker
+marker_copied   = { fg = "$GRN", bg = "$GRN" }
+marker_cut      = { fg = "$RED", bg = "$RED" }
+marker_marked   = { fg = "$CYN", bg = "$CYN" }
+marker_selected = { fg = "$YEL", bg = "$YEL" }
+
+# Count
+count_copied   = { fg = "$DBG", bg = "$GRN" }
+count_cut      = { fg = "$DBG", bg = "$RED" }
+count_selected = { fg = "$DBG", bg = "$YEL" }
+
+# Border
+border_symbol = "│"
+border_style  = { fg = "$MUT" }
+
+# : }}}
+
+
+# : Tabs {{{
+
+[tabs]
+active   = { fg = "$DBG", bg = "$ACC", bold = true }
+inactive = { fg = "$ACC", bg = "$SURF" }
+
+# : }}}
+
+
+# : Mode {{{
+
+[mode]
+
+normal_main = { fg = "$DBG", bg = "$ACC", bold = true }
+normal_alt  = { fg = "$ACC", bg = "$SURF" }
+
+select_main = { fg = "$DBG", bg = "$CYN", bold = true }
+select_alt  = { fg = "$CYN", bg = "$SURF" }
+
+unset_main  = { fg = "$DBG", bg = "$ORG", bold = true }
+unset_alt   = { fg = "$ORG", bg = "$SURF" }
+
+# : }}}
+
+
+# : Status bar {{{
+
+[status]
+perm_sep   = { fg = "$MUT" }
+perm_type  = { fg = "$ACC" }
+perm_read  = { fg = "$YEL" }
+perm_write = { fg = "$RED" }
+perm_exec  = { fg = "$GRN" }
+
+progress_label  = { fg = "$BRIGHT", bold = true }
+progress_normal = { fg = "$GRN", bg = "$SEL" }
+progress_error  = { fg = "$YEL", bg = "$RED" }
+
+# : }}}
+
+
+# : Pick {{{
+
+[pick]
+border   = { fg = "$ACC" }
+active   = { fg = "$MAG", bold = true }
+inactive = {}
+
+# : }}}
+
+
+# : Input {{{
+
+[input]
+border   = { fg = "$ACC" }
+title    = {}
+value    = {}
+selected = { reversed = true }
+
+# : }}}
+
+
+# : Completion {{{
+
+[cmp]
+border = { fg = "$ACC" }
+
+# : }}}
+
+
+# : Tasks {{{
+
+[tasks]
+border  = { fg = "$ACC" }
+title   = {}
+hovered = { fg = "$MAG", bold = true }
+
+# : }}}
+
+
+# : Which {{{
+
+[which]
+mask            = { bg = "$SURF" }
+cand            = { fg = "$CYN" }
+rest            = { fg = "$DIM" }
+desc            = { fg = "$MAG" }
+separator       = "  "
+separator_style = { fg = "$MUT" }
+
+# : }}}
+
+
+# : Help {{{
+
+[help]
+on      = { fg = "$CYN" }
+run     = { fg = "$MAG" }
+hovered = { reversed = true, bold = true }
+footer  = { fg = "$SURF", bg = "$TXT" }
+
+# : }}}
+
+
+# : Spotter {{{
+
+[spot]
+border   = { fg = "$ACC" }
+title    = { fg = "$ACC" }
+tbl_col  = { fg = "$CYN" }
+tbl_cell = { fg = "$MAG", bg = "$SEL" }
+
+# : }}}
+
+
+# : Notification {{{
+
+[notify]
+title_info  = { fg = "$GRN" }
+title_warn  = { fg = "$YEL" }
+title_error = { fg = "$RED" }
+
+# : }}}
+
+
+# : File-specific styles {{{
+
+[filetype]
+
+rules = [
+	# Image
+	{ mime = "image/*", fg = "$CYN" },
+	# Media
+	{ mime = "{audio,video}/*", fg = "$YEL" },
+	# Archive
+	{ mime = "application/{zip,rar,7z*,tar,gzip,xz,zstd,bzip*,lzma,compress,archive,cpio,arj,xar,ms-cab*}", fg = "$MAG" },
+	# Document
+	{ mime = "application/{pdf,doc,rtf}", fg = "$GRN" },
+	# Virtual file system
+	{ mime = "vfs/{absent,stale}", fg = "$DIM" },
+	# Fallback
+	{ url = "*", fg = "$TXT" },
+	{ url = "*/", fg = "$ACC" },
+]
+
+# : }}}
+
+[icon]
+
+dirs = [
+	{ name = ".config", text = "", fg = "$MAG" },
+	{ name = ".git", text = "", fg = "$CYN" },
+	{ name = ".github", text = "", fg = "$ACC" },
+	{ name = "Desktop", text = "", fg = "$GRN" },
+	{ name = "Documents", text = "", fg = "$GRN" },
+	{ name = "Downloads", text = "", fg = "$GRN" },
+	{ name = "Music", text = "", fg = "$GRN" },
+	{ name = "Pictures", text = "", fg = "$GRN" },
+	{ name = "Videos", text = "", fg = "$GRN" },
+	{ name = "Public", text = "", fg = "$GRN" },
+]
+conds = [
+	{ if = "orphan", text = "", fg = "$TXT" },
+	{ if = "link", text = "", fg = "$MUT" },
+	{ if = "dummy", text = "", fg = "$RED" },
+	{ if = "dir & hovered", text = "", fg = "$ACC" },
+	{ if = "dir", text = "", fg = "$ACC" },
+	{ if = "exec", text = "", fg = "$MUT" },
+	{ if = "!dir", text = "", fg = "$TXT" },
+]
+
+EOF
+
+	write_atomic "$dir/README.md" <<EOF
+# omarchy-$theme
+
+Auto-generated Yazi flavor mirroring the Omarchy theme **$theme**.
+Regenerated automatically whenever the theme is applied (see
+~/.config/omarchy/hooks/theme-set.d/). Tweak colors in the theme's
+colors.toml instead of editing this flavor.
+EOF
+
+	# Best-effort preview thumbnail from the theme itself
+	[[ -f $src/preview.png ]] && cp -f "$src/preview.png" "$dir/preview.png" 2>/dev/null || true
+
+	echo "generated: $dir/flavor.toml"
+}
+
+activate_flavor() {
+	local theme=$1
+	[[ -f $THEME_TOML || -f ${THEME_TOML}.pre-omarchy ]] || die "no theme.toml found"
+	[[ -f ${THEME_TOML}.pre-omarchy ]] || cp "$THEME_TOML" "${THEME_TOML}.pre-omarchy"
+	write_atomic "$THEME_TOML" <<EOF
+#"\$schema" = "https://yazi-rs.github.io/schemas/theme.json"
+# Managed by Omarchy (omarchy-yazi-flavor): regenerated on every theme change.
+# Your pre-hook config is preserved at theme.toml.pre-omarchy; personal styling
+# belongs in your own flavor under ~/.config/yazi/flavors/.
+
+[flavor]
+dark  = "omarchy-$theme"
+light = "omarchy-$theme"
+EOF
+	echo "activated: omarchy-$theme -> $THEME_TOML"
+}
+
+main() {
+	mkdir -p "$FLAVORS_DIR"
+
+	case "${1:-}" in
+	--all)
+		local t
+		while IFS= read -r t; do
+			# guard against set -e: themes without palettes are expected skips
+			build_flavor "$(slugify "$t")" || true
+		done < <(omarchy theme list)
+		exit 0
+		;;
+	"")
+		cur=$(cat "$HOME/.local/state/omarchy/current/theme.name" 2>/dev/null) ||
+			die "no current theme and no theme argument given"
+		;;
+	*)
+		cur=$1
+		;;
+	esac
+
+	cur=$(slugify "$cur")
+	build_flavor "$cur"
+	activate_flavor "$cur"
+}
+
+main "$@"
