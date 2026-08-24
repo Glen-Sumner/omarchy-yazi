@@ -9,15 +9,53 @@
 # Flavors land in ~/.config/yazi/flavors/omarchy-<slug>.yazi/ and are kept in
 # sync by the theme-set hook (~/.config/omarchy/hooks/theme-set.d/yazi.sh),
 # so running Yazi instances re-skin instantly on `omarchy theme set ...`.
+#
+# Security model (see README): the current-theme state file and the theme
+# list come from user-writable storage, so every read is bounded in bytes
+# and wall-clock time, happens only from a regular non-symlink file, and
+# every name is reduced to a single bounded path segment before it is ever
+# interpolated into a directory or file path. Any anomaly fails closed.
 set -euo pipefail
 
 FLAVORS_DIR="$HOME/.config/yazi/flavors"
 THEME_TOML="$HOME/.config/yazi/theme.toml"
 
+STATE_FILE="${OMARCHY_YAZI_THEME_STATE:-$HOME/.local/state/omarchy/current/theme.name}"
+NAME_MAX_LEN=64     # longest theme name/slug accepted, in bytes
+READ_MAX_BYTES=256  # bytes ever read from the state file
+READ_TIMEOUT=2      # seconds; hard deadline for the state-file read
+LIST_TIMEOUT=5      # seconds; hard deadline for the all-theme enumeration
+LIST_MAX_ITEMS=64   # themes processed per --all run
+KILL_GRACE=1        # SIGKILL grace (seconds) after timeout(1)'s SIGTERM
+
 die() { echo "omarchy-yazi-flavor: $*" >&2; exit 1; }
 warn() { echo "omarchy-yazi-flavor: warning: $*" >&2; }
 
 slugify() { sed -E 's/<[^>]+>//g' <<<"$1" | tr '[:upper:]' '[:lower:]' | tr ' ' '-'; }
+
+# One bounded, path-safe segment: no separators, no dot-leading names,
+# length-capped. Anything failing this must never reach a filesystem path.
+valid_slug() {
+	local s=$1
+	(( ${#s} <= NAME_MAX_LEN )) || return 1
+	[[ $s =~ ^[a-z0-9][a-z0-9._-]*$ ]]
+}
+
+# Read the current theme safely. The state file lives in user-writable
+# storage and could be swapped for a FIFO, symlink, device node, or plain
+# garbage, so: require a regular non-symlink file, read at most
+# READ_MAX_BYTES under a hard deadline, keep only a printable first line,
+# and fail closed on any anomaly.
+read_current_theme() { # -> name on stdout; rc!=0 on anomaly
+	local f=$1 out
+	[[ -f $f && ! -L $f ]] || return 1
+	out=$(timeout --signal=TERM "--kill-after=${KILL_GRACE}s" "${READ_TIMEOUT}s" \
+		dd if="$f" bs=1 count="$READ_MAX_BYTES" 2>/dev/null) || return 1
+	out=${out%%$'\n'*}
+	(( ${#out} > 0 && ${#out} <= NAME_MAX_LEN )) || return 1
+	[[ $out =~ ^[[:print:]]+$ ]] || return 1
+	printf '%s' "$out"
+}
 
 pal_try() { # pal_try <key> <colors.toml>; prints value or nothing, never fails
 	local v
@@ -77,6 +115,7 @@ write_atomic() { # write_atomic <target> ; content on stdin
 
 	build_flavor() {
 	local theme=$1 dir p src
+	valid_slug "$theme" || { warn "unsafe theme name '$theme', skipping"; return 1; }
 	p=$(resolve_palette "$theme") || { warn "no usable palette for '$theme', skipping"; return 1; }
 	src=$(dirname "$p")
 	dir="$FLAVORS_DIR/omarchy-$theme.yazi"
@@ -353,16 +392,23 @@ main() {
 
 	case "${1:-}" in
 	--all)
-		local t
+		local t n=0
 		while IFS= read -r t; do
+			t=$(slugify "$t")
+			valid_slug "$t" || { warn "skipping untrustworthy theme name"; continue; }
 			# guard against set -e: themes without palettes are expected skips
-			build_flavor "$(slugify "$t")" || true
-		done < <(omarchy theme list)
+			build_flavor "$t" || true
+			if (( ++n >= LIST_MAX_ITEMS )); then
+				warn "theme list truncated at $LIST_MAX_ITEMS entries"
+				break
+			fi
+		done < <(timeout --signal=TERM "--kill-after=${KILL_GRACE}s" \
+			"${LIST_TIMEOUT}s" omarchy theme list 2>/dev/null || true)
 		exit 0
 		;;
 	"")
-		cur=$(cat "$HOME/.local/state/omarchy/current/theme.name" 2>/dev/null) ||
-			die "no current theme and no theme argument given"
+		cur=$(read_current_theme "$STATE_FILE") ||
+			die "could not safely read '$STATE_FILE' (missing, not a regular file, or timed out); refusing to guess"
 		;;
 	*)
 		cur=$1
@@ -370,6 +416,7 @@ main() {
 	esac
 
 	cur=$(slugify "$cur")
+	valid_slug "$cur" || die "refusing unsafe theme name '$cur'"
 	build_flavor "$cur"
 	activate_flavor "$cur"
 }

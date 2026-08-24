@@ -69,6 +69,30 @@ omarchy-yazi-flavor nord         # same, for one theme
 omarchy-yazi-flavor --all        # rebuild every flavor
 ```
 
+## Security model
+
+The current-theme state file (`~/.local/state/omarchy/current/theme.name`)
+and `omarchy theme list` output live in user-writable space, so the plugin
+treats them as untrusted input:
+
+- **Bounded reads** — the state file is read only if it is a regular,
+  non-symlink file, at most 256 bytes, under a 2 s hard deadline
+  (`timeout` with SIGKILL escalation). A FIFO or device node swapped into
+  that path fails closed instead of hanging the helper.
+- **Hard process deadline** — the shell service escalates any helper run:
+  SIGTERM after 30 s, SIGKILL 5 s later.
+- **Watched path never loaded** — the FileView watcher runs with
+  `preload: false`, and every sync first re-checks the watched path is a
+  regular, non-symlink file before doing anything (exit 75 otherwise).
+- **Names are path-safe** — theme names are slugified and then must match
+  `^[a-z0-9][a-z0-9._-]*$` (≤64 chars) before being interpolated into any
+  flavor/palette path; `/`, `..`, hidden names, and control characters are
+  rejected. On any anomaly the plugin exits without writing, leaving the
+  last good flavor active.
+- **Bounded enumeration** — `--all` reads the theme list under a 5 s
+  deadline, processes at most 64 themes per run, and skips untrusted names
+  before they can become write targets.
+
 ## Uninstall
 
 ```bash
