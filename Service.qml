@@ -49,7 +49,7 @@ Item {
       body += '[ -f "$state" ] && [ ! -L "$state" ] || exit 75\nexec "$script"'
     else
       body += '"$script" --all && exec "$script"'
-    syncProc.command = ["bash", "-c", body, "omarchy-yazi-sync", scriptPath, themeStateFile]
+    syncProc.command = ["setsid", "bash", "-c", body, "omarchy-yazi-sync", scriptPath, themeStateFile]
     syncProc.running = true
     termTimer.restart()
   }

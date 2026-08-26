@@ -21,12 +21,16 @@ FLAVORS_DIR="$HOME/.config/yazi/flavors"
 THEME_TOML="$HOME/.config/yazi/theme.toml"
 
 STATE_FILE="${OMARCHY_YAZI_THEME_STATE:-$HOME/.local/state/omarchy/current/theme.name}"
-NAME_MAX_LEN=64     # longest theme name/slug accepted, in bytes
-READ_MAX_BYTES=256  # bytes ever read from the state file
-READ_TIMEOUT=2      # seconds; hard deadline for the state-file read
-LIST_TIMEOUT=5      # seconds; hard deadline for the all-theme enumeration
-LIST_MAX_ITEMS=64   # themes processed per --all run
-KILL_GRACE=1        # SIGKILL grace (seconds) after timeout(1)'s SIGTERM
+NAME_MAX_LEN=64        # longest theme name/slug accepted, in bytes
+READ_MAX_BYTES=256     # bytes ever read from the state file
+READ_TIMEOUT=2         # seconds; hard deadline for the state-file read
+LIST_TIMEOUT=5         # seconds; hard deadline for the all-theme enumeration
+LIST_MAX_ITEMS=64      # themes processed per --all run
+KILL_GRACE=1           # SIGKILL grace (seconds) after timeout(1)'s SIGTERM
+PALETTE_MAX_BYTES=32768 # 32 KB cap for palette file reads
+PALETTE_READ_TIMEOUT=2  # seconds; hard deadline for palette reads
+ALACRITTY_TIMEOUT=5     # seconds; hard deadline for alacritty conversion
+PREVIEW_MAX_BYTES=1048576 # 1 MB cap for preview.png copy
 
 die() { echo "omarchy-yazi-flavor: $*" >&2; exit 1; }
 warn() { echo "omarchy-yazi-flavor: warning: $*" >&2; }
@@ -59,7 +63,10 @@ read_current_theme() { # -> name on stdout; rc!=0 on anomaly
 
 pal_try() { # pal_try <key> <colors.toml>; prints value or nothing, never fails
 	local v
-	v=$(grep -m1 -E "^$1[[:space:]]*=" "$2" 2>/dev/null | sed -E 's/^[^=]*=[[:space:]]*"([^"]*)".*/\1/') || true
+	v=$(head -c "$PALETTE_MAX_BYTES" "$2" 2>/dev/null \
+		| timeout --signal=TERM "--kill-after=${KILL_GRACE}s" "${PALETTE_READ_TIMEOUT}s" \
+		grep -m1 -E "^$1[[:space:]]*=" 2>/dev/null \
+		| sed -E 's/^[^=]*=[[:space:]]*"([^"]*)".*/\1/') || true
 	[[ -n $v ]] && printf '%s' "$v"
 	return 0
 }
@@ -84,6 +91,20 @@ lum() { awk -v h="${1#"#"}" 'BEGIN {
 	printf "%.0f", 0.2126 * r + 0.7152 * g + 0.0722 * b
 }'; }
 
+# Validate a palette value is a safe #rrggbb hex color.
+valid_color() { [[ $1 =~ ^#[0-9a-f]{6}$ ]]; }
+
+# Safe color extraction: returns the value only if it is valid hex,
+# otherwise prints the fallback. Never fails.
+safe_color() { # safe_color <value> <fallback>
+	local v=$1 fb=$2
+	if [[ $v =~ ^#[0-9a-f]{6}$ ]]; then
+		printf '%s' "$v"
+	else
+		printf '%s' "$fb"
+	fi
+}
+
 # Locate or synthesize a usable colors.toml for a theme slug.
 resolve_palette() { # resolve_palette <slug> ; prints path to colors.toml
 	local slug=$1 src p tmp
@@ -92,16 +113,19 @@ resolve_palette() { # resolve_palette <slug> ; prints path to colors.toml
 	p="$src/colors.toml"
 
 	if [[ ! -f $p && -f $src/alacritty.toml ]]; then
+		[[ ! -L $src/alacritty.toml ]] || { warn "symlinked palette rejected: $src/alacritty.toml"; return 1; }
 		tmp=$(mktemp -d)
 		cp "$src/alacritty.toml" "$tmp/"
-		if omarchy-theme-colors-from-alacritty "$tmp" >/dev/null 2>&1 &&
-			[[ -f $tmp/colors.toml ]]; then
+		if timeout --signal=TERM "--kill-after=${KILL_GRACE}s" "${ALACRITTY_TIMEOUT}s" \
+			omarchy-theme-colors-from-alacritty "$tmp" >/dev/null 2>&1 &&
+			[[ -f $tmp/colors.toml && ! -L $tmp/colors.toml ]]; then
 			printf '%s\n' "$tmp/colors.toml"
 			return 0
 		fi
 		rm -rf "$tmp"
 	fi
-	[[ -f $p ]] && { printf '%s\n' "$p"; return 0; }
+	[[ -f $p && ! -L $p ]] && { printf '%s\n' "$p"; return 0; }
+	[[ -L $p ]] && { warn "symlinked palette rejected: $p"; }
 	return 1
 }
 
@@ -119,6 +143,14 @@ write_atomic() { # write_atomic <target> ; content on stdin
 	p=$(resolve_palette "$theme") || { warn "no usable palette for '$theme', skipping"; return 1; }
 	src=$(dirname "$p")
 	dir="$FLAVORS_DIR/omarchy-$theme.yazi"
+
+	# Remove any symlink in the plugin's flavor namespace and recreate as a
+	# real directory. A symlinked dir would redirect writes outside the
+	# documented omarchy-* namespace.
+	if [[ -L "$dir" ]]; then
+		warn "removing symlinked flavor dir: $dir"
+		rm -rf "$dir"
+	fi
 
 	# Normalize across palette schemas: rich omarchy themes carry semantic
 	# keys; alacritty-derived / ANSI-scheme themes only have color0-15.
@@ -149,6 +181,24 @@ write_atomic() { # write_atomic <target> ; content on stdin
 	MODE=$(first_of "$p" mode) || { [[ $(lum "$BG") -gt 127 ]] && MODE=light || MODE=dark; }
 
 	mkdir -p "$dir"
+	[[ ! -L "$dir" ]] || { warn "flavor dir is a symlink after mkdir, skipping: $dir"; return 1; }
+
+	# Validate all colors are safe #rrggbb before interpolating into the heredoc.
+	# A malformed palette value must not break the TOML or execute shell code.
+	BG=$(safe_color "$BG" "#000000")
+	TXT=$(safe_color "$TXT" "$BG")
+	BRIGHT=$(safe_color "$BRIGHT" "$TXT")
+	C1=$(safe_color "${C1:-}" "#888888"); C2=$(safe_color "${C2:-}" "#888888")
+	C3=$(safe_color "${C3:-}" "#888888"); C4=$(safe_color "${C4:-}" "#888888")
+	C5=$(safe_color "${C5:-}" "#888888"); C6=$(safe_color "${C6:-}" "#888888")
+	C8=$(safe_color "${C8:-}" "#888888"); C9=$(safe_color "${C9:-}" "#888888")
+	ACC=$(safe_color "$ACC" "$C4"); RED=$(safe_color "$RED" "$C1")
+	YEL=$(safe_color "$YEL" "$C3"); GRN=$(safe_color "$GRN" "$C2")
+	CYN=$(safe_color "$CYN" "$C6"); MAG=$(safe_color "$MAG" "$C5")
+	ORG=$(safe_color "$ORG" "$YEL")
+	SURF=$(safe_color "$SURF" "$C8"); SEL=$(safe_color "$SEL" "$SURF")
+	MUT=$(safe_color "$MUT" "$SEL"); DIM=$(safe_color "$DIM" "$MUT")
+	DBG=$(safe_color "$DBG" "$BG")
 
 	write_atomic "$dir/flavor.toml" <<EOF
 # vim:fileencoding=utf-8:foldmethod=marker
@@ -364,8 +414,14 @@ Regenerated automatically whenever the theme is applied (see
 colors.toml instead of editing this flavor.
 EOF
 
-	# Best-effort preview thumbnail from the theme itself
-	[[ -f $src/preview.png ]] && cp -f "$src/preview.png" "$dir/preview.png" 2>/dev/null || true
+	# Best-effort preview thumbnail from the theme itself (capped at 1 MB)
+	if [[ -f $src/preview.png && ! -L $src/preview.png ]]; then
+		local psize
+		psize=$(stat --format=%s "$src/preview.png" 2>/dev/null) || psize=0
+		if (( psize > 0 && psize <= PREVIEW_MAX_BYTES )); then
+			cp -f "$src/preview.png" "$dir/preview.png" 2>/dev/null || true
+		fi
+	fi
 
 	echo "generated: $dir/flavor.toml"
 }
@@ -373,7 +429,13 @@ EOF
 activate_flavor() {
 	local theme=$1
 	[[ -f $THEME_TOML || -f ${THEME_TOML}.pre-omarchy ]] || die "no theme.toml found"
-	[[ -f ${THEME_TOML}.pre-omarchy ]] || cp "$THEME_TOML" "${THEME_TOML}.pre-omarchy"
+	# Atomic backup: hard-link then rename to avoid TOCTOU races where two
+	# concurrent syncs could overwrite each other's backup.
+	if [[ ! -f ${THEME_TOML}.pre-omarchy ]]; then
+		ln -f "$THEME_TOML" "${THEME_TOML}.pre-omarchy.tmp" 2>/dev/null \
+			&& mv -f "${THEME_TOML}.pre-omarchy.tmp" "${THEME_TOML}.pre-omarchy" \
+			|| cp "$THEME_TOML" "${THEME_TOML}.pre-omarchy"
+	fi
 	write_atomic "$THEME_TOML" <<EOF
 #"\$schema" = "https://yazi-rs.github.io/schemas/theme.json"
 # Managed by Omarchy (omarchy-yazi-flavor): regenerated on every theme change.

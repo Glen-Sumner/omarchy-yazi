@@ -71,16 +71,37 @@ omarchy-yazi-flavor --all        # rebuild every flavor
 
 ## Security model
 
-The current-theme state file (`~/.local/state/omarchy/current/theme.name`)
-and `omarchy theme list` output live in user-writable space, so the plugin
-treats them as untrusted input:
+The current-theme state file (`~/.local/state/omarchy/current/theme.name`),
+`omarchy theme list` output, and per-theme palette files live in user-writable
+space, so the plugin treats them as untrusted input:
 
 - **Bounded reads** — the state file is read only if it is a regular,
   non-symlink file, at most 256 bytes, under a 2 s hard deadline
   (`timeout` with SIGKILL escalation). A FIFO or device node swapped into
   that path fails closed instead of hanging the helper.
-- **Hard process deadline** — the shell service escalates any helper run:
-  SIGTERM after 30 s, SIGKILL 5 s later.
+- **Palette read bounds** — palette files (`colors.toml`) are read through
+  `head -c 32768` (32 KB cap) under a 2 s deadline. Symlinked palette files
+  are rejected outright. The alacritty-to-colors conversion runs under a
+  5 s timeout with SIGKILL escalation.
+- **Color validation** — every palette-extracted value is validated against
+  `^#[0-9a-f]{6}$` before interpolation into generated TOML. Invalid values
+  fall back to safe defaults, preventing heredoc injection from malformed
+  palette data.
+- **Preview size cap** — theme preview images (`preview.png`) are only
+  copied if they are regular files under 1 MB, preventing disk exhaustion
+  from oversized assets.
+- **Flavor directory symlink removal** — if a generated `omarchy-*.yazi`
+  directory has been replaced with a symlink (redirecting writes outside
+  the documented namespace), the plugin removes the symlink and recreates
+  a real directory. This prevents write-escape from the `omarchy-*`
+  namespace.
+- **Atomic configuration backup** — before overwriting `theme.toml`, the
+  original is preserved via hard-link-then-rename, which is atomic and
+  race-free even under concurrent syncs.
+- **Hard process-tree deadline** — the shell service launches helpers
+  under `setsid` so they become process group leaders. SIGTERM after 30 s
+  and SIGKILL 5 s later are delivered to the entire process group, ensuring
+  child processes (grep, dd, timeout, etc.) cannot accumulate as orphans.
 - **Watched path never loaded** — the FileView watcher runs with
   `preload: false`, and every sync first re-checks the watched path is a
   regular, non-symlink file before doing anything (exit 75 otherwise).
